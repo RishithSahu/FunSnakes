@@ -6,12 +6,13 @@ import time
 import random
 import json
 import math
+import ssl  # Add SSL import
 from collections import deque
 
 try:
     from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
-                                QLabel, QPushButton, QLineEdit, QListWidget, QWidget, 
-                                QMessageBox, QFileDialog, QMenu, QAction)
+                               QLabel, QPushButton, QLineEdit, QListWidget, QWidget, 
+                               QMessageBox, QFileDialog, QMenu, QAction, QCheckBox)  # Add QCheckBox
     from PyQt5.QtCore import Qt, QThread, pyqtSignal
 except ImportError as e:
     print(f"Required libraries not found: {e}")
@@ -304,7 +305,7 @@ class ServerThread(QThread):
     log_signal = pyqtSignal(str)
     clients_updated = pyqtSignal(int)
 
-    def __init__(self, host, port, max_clients=20):
+    def __init__(self, host, port, max_clients=20, use_ssl=True):  # Add use_ssl parameter
         super().__init__()
         self.host = host
         self.port = port
@@ -314,6 +315,8 @@ class ServerThread(QThread):
         self.running = False
         self.game_state = GameState()
         self.client_input_queues = {}  # Map of player_id -> input queue
+        self.use_ssl = use_ssl  # Store SSL setting
+        self.ssl_context = None  # Will store the SSL context if SSL is enabled
 
     def run(self):
         try:
@@ -321,12 +324,35 @@ class ServerThread(QThread):
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             
+            # Set up SSL if enabled
+            if self.use_ssl:
+                # Create SSL context
+                self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+                
+                # Check for existing certificate and key
+                cert_path = "server.crt"
+                key_path = "server.key"
+                
+                # If certificates don't exist, create self-signed ones
+                if not (os.path.exists(cert_path) and os.path.exists(key_path)):
+                    self.log_signal.emit("SSL certificate not found. Creating self-signed certificate...")
+                    self.generate_self_signed_cert(cert_path, key_path)
+                
+                # Load the certificate and key
+                try:
+                    self.ssl_context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+                    self.log_signal.emit("SSL certificate loaded successfully")
+                except Exception as e:
+                    self.log_signal.emit(f"Error loading SSL certificate: {e}")
+                    self.use_ssl = False  # Fall back to non-SSL mode
+            
             # Modified to use '' to listen on all network interfaces
             self.server_socket.bind(('', self.port))
             self.server_socket.listen(self.max_clients)
             
             local_ip = self.get_local_ip()
-            self.log_signal.emit(f"Game server started on {local_ip}:{self.port}")
+            protocol = "https" if self.use_ssl else "http"
+            self.log_signal.emit(f"Game server started on {local_ip}:{self.port} using {protocol}")
             self.running = True
 
             # Start the game loop thread
@@ -339,6 +365,17 @@ class ServerThread(QThread):
                 self.server_socket.settimeout(1.0)
                 try:
                     client_socket, address = self.server_socket.accept()
+                    
+                    # Wrap socket with SSL if enabled
+                    if self.use_ssl and self.ssl_context:
+                        try:
+                            client_socket = self.ssl_context.wrap_socket(
+                                client_socket, server_side=True)
+                            self.log_signal.emit(f"SSL handshake successful with {address}")
+                        except ssl.SSLError as e:
+                            self.log_signal.emit(f"SSL handshake failed with {address}: {e}")
+                            client_socket.close()
+                            continue
                     
                     # Check max clients limit
                     if len(self.clients) >= self.max_clients:
@@ -365,6 +402,146 @@ class ServerThread(QThread):
         finally:
             self.stop()
     
+    def generate_self_signed_cert(self, cert_path, key_path):
+        """Generate a self-signed certificate for SSL connections"""
+        try:
+            # First try using Python's built-in SSL module to generate certificates
+            # This avoids dependency on external OpenSSL command
+            from cryptography import x509
+            from cryptography.x509.oid import NameOID
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            from cryptography.hazmat.primitives import serialization
+            import datetime
+            
+            # Generate a private key
+            private_key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=2048,
+            )
+            
+            # Write private key to file
+            with open(key_path, "wb") as f:
+                f.write(private_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption()
+                ))
+            
+            # Generate a self-signed certificate
+            subject = issuer = x509.Name([
+                x509.NameAttribute(NameOID.COMMON_NAME, u"FunSnakes Game Server"),
+            ])
+            
+            cert = x509.CertificateBuilder().subject_name(
+                subject
+            ).issuer_name(
+                issuer
+            ).public_key(
+                private_key.public_key()
+            ).serial_number(
+                x509.random_serial_number()
+            ).not_valid_before(
+                datetime.datetime.utcnow()
+            ).not_valid_after(
+                # Certificate valid for 365 days
+                datetime.datetime.utcnow() + datetime.timedelta(days=365)
+            ).add_extension(
+                x509.SubjectAlternativeName([
+                    # Allow connections to localhost
+                    x509.DNSName(u"localhost"),
+                    # Allow connections to any IP
+                    x509.DNSName(self.get_local_ip())
+                ]),
+                critical=False
+            ).sign(private_key, hashes.SHA256())
+            
+            # Write certificate to file
+            with open(cert_path, "wb") as f:
+                f.write(cert.public_bytes(serialization.Encoding.PEM))
+            
+            self.log_signal.emit(f"Self-signed certificate generated at {cert_path}")
+            
+        except ImportError:
+            # If cryptography module is not available, try using OpenSSL command
+            self.log_signal.emit("Python cryptography module not found, trying OpenSSL command...")
+            try:
+                import subprocess
+                import os
+                
+                # Generate private key
+                key_cmd = [
+                    "openssl", "genrsa",
+                    "-out", key_path,
+                    "2048"
+                ]
+                subprocess.run(key_cmd, check=True)
+                
+                # Generate self-signed certificate (valid for 365 days)
+                cert_cmd = [
+                    "openssl", "req",
+                    "-new", "-x509",
+                    "-key", key_path,
+                    "-out", cert_path,
+                    "-days", "365",
+                    "-subj", "/CN=FunSnakes Game Server"
+                ]
+                subprocess.run(cert_cmd, check=True)
+                
+                self.log_signal.emit(f"Self-signed certificate generated at {cert_path}")
+                
+            except Exception as e:
+                # If OpenSSL commands fail, create a very simple certificate
+                self.log_signal.emit(f"Failed to generate certificate using OpenSSL: {e}")
+                self.log_signal.emit("Falling back to simple certificate generation...")
+                
+                # Generate simple certificate and key
+                import ssl
+                import os
+                
+                # Create a temporary directory for the certificates
+                cert_dir = os.path.dirname(cert_path)
+                os.makedirs(cert_dir, exist_ok=True)
+                
+                # Generate a simple self-signed certificate
+                try:
+                    # Generate a fixed key using Python's built-in modules
+                    from socket import gethostname
+                    from OpenSSL import crypto
+                    
+                    # Create a key pair
+                    k = crypto.PKey()
+                    k.generate_key(crypto.TYPE_RSA, 2048)
+                    
+                    # Create a self-signed cert
+                    cert = crypto.X509()
+                    cert.get_subject().CN = gethostname()
+                    cert.set_serial_number(1000)
+                    cert.gmtime_adj_notBefore(0)
+                    cert.gmtime_adj_notAfter(365*24*60*60)  # 1 year expiry
+                    cert.set_issuer(cert.get_subject())
+                    cert.set_pubkey(k)
+                    cert.sign(k, 'sha256')
+                    
+                    # Save certificate
+                    with open(cert_path, "wb") as f:
+                        f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
+                        
+                    # Save private key
+                    with open(key_path, "wb") as f:
+                        f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, k))
+                        
+                    self.log_signal.emit(f"Simple self-signed certificate generated at {cert_path}")
+                except Exception as e:
+                    self.log_signal.emit(f"Failed to generate simple certificate: {e}")
+                    self.log_signal.emit("SSL will be disabled - please create certificates manually")
+                    self.use_ssl = False
+                    
+        except Exception as e:
+            self.log_signal.emit(f"Failed to generate certificate: {e}")
+            self.log_signal.emit("Please create certificates manually and place them in the application directory")
+            self.use_ssl = False
+
     def handle_client(self, client_socket, address):
         try:
             # Wait for the initial join message with player name and color
@@ -605,6 +782,10 @@ class SnakeGameHostApp(QMainWindow):
         self.max_clients_input = QLineEdit('20')
         self.max_clients_input.setPlaceholderText('Max Players')
         
+        # Add SSL checkbox
+        self.use_ssl_checkbox = QCheckBox('Enable SSL')
+        self.use_ssl_checkbox.setChecked(True)
+        
         start_server_btn = QPushButton('Start Server')
         stop_server_btn = QPushButton('Stop Server')
         start_server_btn.clicked.connect(self.start_server)
@@ -615,6 +796,7 @@ class SnakeGameHostApp(QMainWindow):
         server_layout.addWidget(self.port_input)
         server_layout.addWidget(QLabel('Max Players:'))
         server_layout.addWidget(self.max_clients_input)
+        server_layout.addWidget(self.use_ssl_checkbox)
         server_layout.addWidget(start_server_btn)
         server_layout.addWidget(stop_server_btn)
         main_layout.addLayout(server_layout)
@@ -689,8 +871,11 @@ class SnakeGameHostApp(QMainWindow):
         if self.server_thread:
             self.stop_server()
 
+        # Get SSL setting
+        use_ssl = self.use_ssl_checkbox.isChecked()
+
         # Start new server thread - use empty string to bind to all interfaces
-        self.server_thread = ServerThread('', port, max_clients)
+        self.server_thread = ServerThread('', port, max_clients, use_ssl)
         self.server_thread.log_signal.connect(self.log_message)
         self.server_thread.clients_updated.connect(self.update_clients_count)
         self.server_thread.start()

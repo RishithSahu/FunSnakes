@@ -5,11 +5,12 @@ import math
 import threading
 import time
 import random
+import ssl  # Add SSL import
 
 try:
     from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
-                                QLabel, QPushButton, QLineEdit, QListWidget, QWidget, 
-                                QMessageBox, QMenu, QAction, QShortcut)
+                               QLabel, QPushButton, QLineEdit, QListWidget, QWidget, 
+                               QMessageBox, QFileDialog, QMenu, QAction, QCheckBox, QShortcut)  # Add QShortcut
     from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRectF, QRect, QTimer
     from PyQt5.QtGui import QPainter, QColor, QBrush, QPen, QFont, QKeySequence
 except ImportError as e:
@@ -319,7 +320,7 @@ class ClientThread(QThread):
     game_state_signal = pyqtSignal(dict)
     chat_message_signal = pyqtSignal(str, str, str)  # player_id, player_name, message
     
-    def __init__(self, host, port, player_name, color, timeout=10):
+    def __init__(self, host, port, player_name, color, timeout=10, use_ssl=True):  # Add use_ssl param
         super().__init__()
         self.host = host
         self.port = port
@@ -330,6 +331,7 @@ class ClientThread(QThread):
         self.running = True
         self.direction = [0, 0]  # Current direction vector
         self.last_input_time = 0
+        self.use_ssl = use_ssl  # Store SSL setting
     
     def run(self):
         try:
@@ -354,6 +356,33 @@ class ClientThread(QThread):
 
             # Connect to the server
             self.client_socket.connect((server_ip, self.port))
+            
+            # Wrap socket with SSL if enabled
+            if self.use_ssl:
+                try:
+                    ssl_context = ssl.create_default_context()
+                    ssl_context.check_hostname = False  # Disable hostname verification for self-signed certs
+                    ssl_context.verify_mode = ssl.CERT_NONE  # Accept self-signed certificates
+                    
+                    self.client_socket = ssl_context.wrap_socket(
+                        self.client_socket, server_hostname=self.host)
+                    
+                    # Get certificate info
+                    cert = self.client_socket.getpeercert(binary_form=True)
+                    if cert:
+                        self.log_signal.emit("SSL handshake successful")
+                    else:
+                        self.log_signal.emit("Warning: Server certificate not verified")
+                        
+                except ssl.SSLError as e:
+                    self.log_signal.emit(f"SSL handshake failed: {e}")
+                    self.log_signal.emit("Attempting to connect without SSL...")
+                    # Reconnect without SSL
+                    self.client_socket.close()
+                    self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.client_socket.settimeout(self.timeout)
+                    self.client_socket.connect((server_ip, self.port))
+            
             self.log_signal.emit(f"Connected to {self.host}:{self.port}")
             self.connection_status_signal.emit(True)
             
@@ -551,6 +580,10 @@ class SnakeGameClientApp(QMainWindow):
         self.color_input = QLineEdit('#' + ''.join([random.choice('0123456789ABCDEF') for _ in range(6)]))
         self.color_input.setPlaceholderText('Color (hex)')
         
+        # Add SSL checkbox
+        self.use_ssl_checkbox = QCheckBox('Enable SSL')
+        self.use_ssl_checkbox.setChecked(True)
+        
         # Connect button
         connect_btn = QPushButton('Join Game')
         connect_btn.clicked.connect(self.join_game)
@@ -563,6 +596,7 @@ class SnakeGameClientApp(QMainWindow):
         connection_layout.addWidget(self.name_input)
         connection_layout.addWidget(QLabel('Color:'))
         connection_layout.addWidget(self.color_input)
+        connection_layout.addWidget(self.use_ssl_checkbox)
         connection_layout.addWidget(connect_btn)
         
         main_layout.addLayout(connection_layout)
@@ -677,9 +711,12 @@ class SnakeGameClientApp(QMainWindow):
             QMessageBox.warning(self, "Input Error", "Please enter a valid color (e.g., #FF5500)")
             return
         
+        # Get SSL setting
+        use_ssl = self.use_ssl_checkbox.isChecked()
+        
         # Start client thread
         try:
-            self.client_thread = ClientThread(host, port, name, color)
+            self.client_thread = ClientThread(host, port, name, color, use_ssl=use_ssl)
             self.client_thread.log_signal.connect(self.log_message)
             self.client_thread.connection_status_signal.connect(self.update_connection_status)
             self.client_thread.game_state_signal.connect(self.game_view.update_game_state)
