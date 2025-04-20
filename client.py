@@ -38,12 +38,17 @@ class GameView(QWidget):
         self.is_dead = False  # Death state flag
         self.death_message = "You died!"  # Message to show when player dies
         self.allow_focus_change = True  # This flag will track if we want to allow focus changes
+        self.last_score = 0  # Store the last score for reconnection purposes
+        self.last_length = 0  # Store the last length for reconnection purposes
+        
+        # Store the highest score seen during this session
+        self.highest_score = 0
+        self.highest_length = 5
     
     def update_game_state(self, game_state):
         self.game_state = game_state
         self.player_id = game_state.get("player_id")
         
-        # Check if player's snake exists and is alive
         player_alive = False
         player_exists = False
         
@@ -52,16 +57,34 @@ class GameView(QWidget):
                 player_exists = True
                 if snake["alive"]:
                     player_alive = True
-                    # Only reset death state when snake is fully alive and exists
                     self.is_dead = False
                     self.death_time = 0
-                    print(f"Player is alive with segments: {len(snake['segments'])}")
+                    # Store player's score and length for reconnection
+                    self.last_score = snake["score"]
+                    self.last_length = len(snake["segments"]) if "segments" in snake else 0
+                    
+                    # Update highest score/length seen
+                    if self.last_score > self.highest_score:
+                        self.highest_score = self.last_score
+                    if self.last_length > self.highest_length:
+                        self.highest_length = self.last_length
+                    
                 elif not self.is_dead:  # Just died
+                    # Still store the last score when the player dies
+                    self.last_score = snake["score"]
+                    self.last_length = len(snake["segments"]) if "segments" in snake else 0
+                    
+                    # Update highest values
+                    if self.last_score > self.highest_score:
+                        self.highest_score = self.last_score
+                    if self.last_length > self.highest_length:
+                        self.highest_length = self.last_length
+                        
+                    print(f"Player died with score={self.last_score}, length={self.last_length}")
+                    print(f"Highest stats preserved: score={self.highest_score}, length={self.highest_length}")
                     self.is_dead = True
                     self.death_time = time.time()
                     self.death_message = f"You died! Respawning in {self.respawn_delay} seconds..."
-                    print(f"Player died at {self.death_time}")
-                    
                 break
         
         # If player doesn't exist in the snake list but we have a player_id,
@@ -302,8 +325,7 @@ class GameView(QWidget):
             main_window = self.window()
             if hasattr(main_window, 'send_direction'):
                 main_window.send_direction(dx, dy)
-                print(f"Key pressed: {dx}, {dy}")
-
+                
     def focusOutEvent(self, event):
         # Only keep focus if we're not allowing focus change
         if not self.allow_focus_change:
@@ -320,7 +342,7 @@ class ClientThread(QThread):
     game_state_signal = pyqtSignal(dict)
     chat_message_signal = pyqtSignal(str, str, str)  # player_id, player_name, message
     
-    def __init__(self, host, port, player_name, color, timeout=10, use_ssl=True):  # Add use_ssl param
+    def __init__(self, host, port, player_name, color, timeout=10, use_ssl=True):
         super().__init__()
         self.host = host
         self.port = port
@@ -332,8 +354,23 @@ class ClientThread(QThread):
         self.direction = [0, 0]  # Current direction vector
         self.last_input_time = 0
         self.use_ssl = use_ssl  # Store SSL setting
+        self.socket_lock = threading.Lock()  # Add a lock for socket operations
+        self.socket_valid = False  # Flag to track socket validity
+        self.reconnect_attempts = 0  # Track reconnection attempts
+        self.max_reconnect_attempts = 3  # Allow one reconnection attempt
+        self.force_reconnect = False  # New flag to force reconnection status
+        self.previous_id = None  # Store the previous player ID
+        self.previous_score = 0  # Default to 0
+        self.previous_length = 5  # Default to 5 (minimum snake length)
     
     def run(self):
+        try:
+            self.connect_to_server()
+        except Exception as e:
+            self.log_signal.emit(f"Initial connection error: {str(e)}")
+            self.connection_status_signal.emit(False)
+    
+    def connect_to_server(self):
         try:
             # Create socket with timeout
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -384,14 +421,58 @@ class ClientThread(QThread):
                     self.client_socket.connect((server_ip, self.port))
             
             self.log_signal.emit(f"Connected to {self.host}:{self.port}")
+            self.socket_valid = True  # Set socket as valid after successful connection
             self.connection_status_signal.emit(True)
             
-            # Send join message
+            # Check if previous score and length are available and ensure they're valid numbers
+            last_score = getattr(self, 'previous_score', 0) or 0  # Use 0 if None or falsey
+            last_length = getattr(self, 'previous_length', 5) or 5  # Use 5 if None or falsey
+
+            # Check if we have a highest score in the game view
+            game_view = self.get_game_view()
+            if game_view and hasattr(game_view, 'highest_score') and game_view.highest_score > last_score:
+                last_score = game_view.highest_score
+                last_length = game_view.highest_length
+                self.log_signal.emit(f"Using highest score: {last_score}, length: {last_length}")
+
+            # Ensure they're integers
+            try:
+                last_score = int(last_score)
+                last_length = int(last_length)
+            except (ValueError, TypeError):
+                last_score = 0
+                last_length = 5
+
+            # CRITICAL FIX: Use force_reconnect flag if we have a score
+            is_reconnect = False
+            if last_score > 0:
+                is_reconnect = True  # Always treat as reconnection if we have a score
+                self.force_reconnect = True
+            else:
+                is_reconnect = (self.reconnect_attempts > 0)
+
+            
+            # Send join message with score info if reconnecting
             join_message = {
                 "type": "join",
                 "name": self.player_name,
-                "color": self.color
+                "color": self.color,
+                "reconnect": is_reconnect,
+                "last_score": last_score,
+                "last_length": last_length
             }
+
+            # Add previous ID if we have one
+            if hasattr(self, 'previous_id') and self.previous_id is not None:
+                join_message["previous_id"] = self.previous_id
+
+            if is_reconnect:
+                self.log_signal.emit(f"Reconnecting with previous score: {last_score}, length: {last_length}")
+                if hasattr(self, 'previous_id') and self.previous_id is not None:
+                    self.log_signal.emit(f"Using previous ID: {self.previous_id}")
+            else:
+                self.log_signal.emit("Connecting as a new player")
+            
             self.send_message(join_message)
             
             # Start input sending thread
@@ -400,45 +481,112 @@ class ClientThread(QThread):
             input_thread.start()
             
             # Main message receiving loop
+            buffer = ""
             while self.running:
                 try:
                     data = self.client_socket.recv(16384)  # Larger buffer for game state
                     if not data:
+                        self.log_signal.emit("Connection closed by server")
                         break
                     
-                    # Process received data
-                    self.process_message(data.decode('utf-8'))
+                    try:
+                        # Process received data
+                        text_data = data.decode('utf-8')
+                        buffer += text_data
+                        
+                        # Process complete messages that end with newlines
+                        while '\n' in buffer:
+                            line, buffer = buffer.split('\n', 1)
+                            if line.strip():  # Skip empty lines
+                                try:
+                                    # Check for concatenated JSON objects (the main issue)
+                                    if '}{' in line:
+                                        self.log_signal.emit("Warning: Detected concatenated JSON objects")
+                                        # Split concatenated objects
+                                        parts = self.split_json_objects(line)
+                                        for part in parts:
+                                            if part.strip():
+                                                self.process_message(part)
+                                    else:
+                                        # Normal case - single JSON object
+                                        self.process_message(line)
+                                except Exception as e:
+                                    self.log_signal.emit(f"Error processing message: {str(e)}")
+                                    debug_snippet = line[:50] + "..." if len(line) > 50 else line
+                                    self.log_signal.emit(f"Problematic message: {debug_snippet}")
+                    except UnicodeDecodeError as e:
+                        self.log_signal.emit(f"Unicode decode error: {e}")
+                        # Skip invalid data and continue
+                        buffer = ""
+                    
                 except socket.timeout:
+                    # Timeouts are normal, just continue
                     continue
+                except ConnectionResetError as e:
+                    self.log_signal.emit(f"Connection reset by server: {e}")
+                    break
                 except Exception as e:
                     self.log_signal.emit(f"Error receiving data: {str(e)}")
                     break
+            
+            # If we get here, the connection has been broken
+            # Try to reconnect once if we haven't exceeded our reconnection attempts
+            if self.running and self.reconnect_attempts < self.max_reconnect_attempts:
+                self.reconnect_attempts += 1
+                self.log_signal.emit(f"Connection lost. Attempting to reconnect (attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})...")
+                self.cleanup(notify=False)  # Clean up without notifying disconnect
+                time.sleep(1)  # Wait a bit before reconnecting
+                self.connect_to_server()  # Try to reconnect
+            else:
+                # Cleanup and notify disconnect
+                self.cleanup()
         
         except socket.timeout:
             self.log_signal.emit(f"Connection to {self.host}:{self.port} timed out")
-            self.connection_status_signal.emit(False)
+            # Try to reconnect once if we haven't exceeded our reconnection attempts
+            if self.running and self.reconnect_attempts < self.max_reconnect_attempts:
+                self.reconnect_attempts += 1
+                self.log_signal.emit(f"Attempting to reconnect (attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})...")
+                time.sleep(1)  # Wait a bit before reconnecting
+                self.connect_to_server()  # Try to reconnect
+            else:
+                self.connection_status_signal.emit(False)
         except ConnectionRefusedError:
             self.log_signal.emit(f"Connection refused by {self.host}:{self.port}. Make sure the server is running.")
-            self.connection_status_signal.emit(False)
+            # Try to reconnect once if we haven't exceeded our reconnection attempts
+            if self.running and self.reconnect_attempts < self.max_reconnect_attempts:
+                self.reconnect_attempts += 1
+                self.log_signal.emit(f"Attempting to reconnect (attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})...")
+                time.sleep(2)  # Wait a bit longer before reconnecting
+                self.connect_to_server()  # Try to reconnect
+            else:
+                self.connection_status_signal.emit(False)
         except Exception as e:
             self.log_signal.emit(f"Client error: {str(e)}")
-            self.connection_status_signal.emit(False)
-        finally:
-            self.cleanup()
+            # Try to reconnect once if we haven't exceeded our reconnection attempts
+            if self.running and self.reconnect_attempts < self.max_reconnect_attempts:
+                self.reconnect_attempts += 1
+                self.log_signal.emit(f"Attempting to reconnect (attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})...")
+                time.sleep(1)  # Wait a bit before reconnecting
+                self.connect_to_server()  # Try to reconnect
+            else:
+                self.connection_status_signal.emit(False)
     
     def send_input_loop(self):
         """Thread that sends direction input to the server"""
         while self.running:
-            # Send direction input at regular intervals
-            current_time = time.time()
-            if current_time - self.last_input_time >= 0.15:  # Increased to 150ms
-                self.last_input_time = current_time
-                self.send_direction()
+            # Check if socket is valid before sending
+            if self.socket_valid:
+                # Send direction input at regular intervals
+                current_time = time.time()
+                if current_time - self.last_input_time >= 0.15:  # Increased to 150ms
+                    self.last_input_time = current_time
+                    self.send_direction()
             time.sleep(0.05)  # Increased sleep time
     
     def send_direction(self):
         """Send current direction to the server"""
-        if not self.running or not self.client_socket:
+        if not self.running or not self.client_socket or not self.socket_valid:
             return
             
         # Only send if there's a direction to send and it's changed
@@ -454,75 +602,152 @@ class ClientThread(QThread):
         """Set the current direction vector"""
         self.direction = [dx, dy]
         
+    def split_json_objects(self, text):
+        """Split potentially concatenated JSON objects."""
+        result = []
+        # Find objects by matching braces
+        start = 0
+        brace_count = 0
+        in_string = False
+        escape = False
+        
+        for i, char in enumerate(text):
+            if escape:
+                escape = False
+                continue
+                
+            if char == '"' and not escape:
+                in_string = not in_string
+            elif not in_string:
+                if char == '{':
+                    if brace_count == 0:
+                        start = i
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        # Found a complete JSON object
+                        result.append(text[start:i+1])
+            elif char == '\\':
+                escape = True
+                
+        self.log_signal.emit(f"Split into {len(result)} JSON objects")
+        return result
+    
     def process_message(self, data):
         """Process incoming messages from the server"""
         try:
-            messages = data.split('\n')
-            for message_str in messages:
-                if not message_str:
-                    continue
-                    
-                message = json.loads(message_str)
-                message_type = message.get("type")
-                
-                if message_type == "join_ack":
-                    # Received acknowledgement of our join request
-                    player_id = message.get("player_id")
-                    self.log_signal.emit(f"Joined game as player {player_id}")
-                
-                elif message_type == "state_update":
-                    # Received game state update
-                    game_state = message.get("state")
-                    if game_state:
-                        self.game_state_signal.emit(game_state)
-                
-                elif message_type == "chat":
-                    # Handle chat message
-                    player_id = str(message.get("player_id", ""))
-                    player_name = message.get("player_name", "Unknown")
-                    text = message.get("text", "")
-                    self.chat_message_signal.emit(player_id, player_name, text)
-                
-                elif message_type == "error":
-                    # Handle error messages
-                    self.log_signal.emit(f"Error from server: {message.get('message')}")
+            message = json.loads(data)
+            message_type = message.get("type")
+            
+            if message_type == "join_ack":
+                # Received acknowledgement of our join request
+                player_id = message.get("player_id")
+                self.previous_id = player_id  # Store the ID for future reconnections
+                self.log_signal.emit(f"Joined game as player {player_id}")
+            
+            elif message_type == "state_update":
+                # Received game state update
+                game_state = message.get("state")
+                if game_state:
+                    self.game_state_signal.emit(game_state)
+            
+            elif message_type == "chat":
+                # Handle chat message
+                player_id = str(message.get("player_id", ""))
+                player_name = message.get("player_name", "Unknown")
+                text = message.get("text", "")
+                self.chat_message_signal.emit(player_id, player_name, text)
+            
+            elif message_type == "error":
+                # Handle error messages
+                self.log_signal.emit(f"Error from server: {message.get('message')}")
         
         except json.JSONDecodeError as e:
             self.log_signal.emit(f"Error parsing message: {str(e)}")
+            # Print part of the message for debugging
+            debug_snippet = data[:50] + "..." if len(data) > 50 else data
+            self.log_signal.emit(f"Problematic message snippet: {debug_snippet}")
         except Exception as e:
             self.log_signal.emit(f"Error processing message: {str(e)}")
     
     def send_message(self, message):
         """Send a message to the server"""
-        if not self.client_socket:
-            return
-            
-        try:
-            # Ensure we end with a newline for message framing
-            message_str = json.dumps(message) + "\n"
-            self.client_socket.sendall(message_str.encode('utf-8'))
-        except Exception as e:
-            self.log_signal.emit(f"Error sending message: {str(e)}")
+        # Use a lock to prevent socket operations from multiple threads at once
+        with self.socket_lock:
+            if not self.client_socket or not self.socket_valid:
+                return
+                
+            try:
+                # Ensure we end with a newline for message framing
+                message_str = json.dumps(message) + "\n"
+                self.client_socket.sendall(message_str.encode('utf-8'))
+            except ConnectionResetError as e:
+                self.log_signal.emit(f"Connection reset: {e}")
+                self.socket_valid = False
+                self.running = False
+            except ConnectionAbortedError as e:
+                self.log_signal.emit(f"Connection aborted: {e}")
+                self.socket_valid = False
+                self.running = False
+            except OSError as e:
+                if e.winerror == 10038:  # Socket operation on non-socket
+                    self.log_signal.emit("Socket is no longer valid")
+                    self.socket_valid = False
+                    self.running = False
+                else:
+                    self.log_signal.emit(f"Socket error: {e}")
+                    self.socket_valid = False
+            except Exception as e:
+                self.log_signal.emit(f"Error sending message: {str(e)}")
+                self.socket_valid = False
     
-    def cleanup(self):
-        # Cleanup method
+    def cleanup(self, notify=True):
+        # Mark socket as invalid first
+        self.socket_valid = False
+        
+        # Cleanup method with better exception handling
         try:
             if self.client_socket:
-                self.client_socket.close()
+                try:
+                    # Try to properly close the socket
+                    self.client_socket.shutdown(socket.SHUT_RDWR)
+                except (OSError, socket.error):
+                    # Socket might already be closed, which is fine
+                    pass
+                finally:
+                    self.client_socket.close()
+                    self.client_socket = None
         except Exception as e:
             self.log_signal.emit(f"Cleanup error: {str(e)}")
 
-        self.log_signal.emit("Disconnected from server")
-        self.connection_status_signal.emit(False)
+        if notify:
+            self.log_signal.emit("Disconnected from server")
+            self.connection_status_signal.emit(False)
 
     def stop(self):
         self.running = False
         self.cleanup()
 
+    def get_game_view(self):
+        """Helper method to get access to the game view from the main window"""
+        try:
+            # Find the main window
+            for widget in QApplication.topLevelWidgets():
+                if isinstance(widget, SnakeGameClientApp):
+                    return widget.game_view
+        except:
+            pass
+        return None
+
 class SnakeGameClientApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.client_thread = None
+        
+        # Add persistent score storage
+        self.saved_scores = {}  # Player name -> {score, length}
+        
         self.initUI()
         
         # Timer for direction updates - slower updates to reduce network traffic
@@ -683,9 +908,40 @@ class SnakeGameClientApp(QMainWindow):
                 self.client_thread.set_direction(direction[0], direction[1])
     
     def join_game(self):
+        # Get player name for score lookup
+        player_name = self.name_input.text().strip()
+        
+        # Determine the best score to use
+        current_score = 0
+        current_length = 5
+        
+        # First check if the game view has a highest score
+        if hasattr(self.game_view, 'highest_score') and self.game_view.highest_score > 0:
+            current_score = self.game_view.highest_score
+            current_length = self.game_view.highest_length
+            print(f"Using game view highest score: {current_score}")
+        
+        # Then check if we have a saved score that's even better
+        if player_name in self.saved_scores:
+            saved_data = self.saved_scores[player_name]
+            saved_score = saved_data.get('score', 0)
+            saved_length = saved_data.get('length', 5)
+            
+            if saved_score > current_score:
+                current_score = saved_score
+                current_length = saved_length
+                print(f"Using saved score: {current_score}")
+        
+        # For debug purposes - add more detailed logging
+        if current_score > 0:
+            # print(f"*** PRESERVING SCORE: {current_score} AND LENGTH: {current_length} ***")
+            self.log_message(f"*** PRESERVING SCORE: {current_score} AND LENGTH: {current_length} ***")
+        
         # Stop any existing client thread
-        if self.client_thread:
+        if self.client_thread and self.client_thread.isRunning():
             self.client_thread.stop()
+            # Give it a moment to properly clean up
+            time.sleep(0.5)
 
         # Validate inputs
         host = self.host_input.text().strip()
@@ -714,16 +970,32 @@ class SnakeGameClientApp(QMainWindow):
         # Get SSL setting
         use_ssl = self.use_ssl_checkbox.isChecked()
         
+        # Update UI to show connection attempt
+        self.log_message(f"Attempting to connect to {host}:{port}...")
+        self.connection_status_label.setText("Status: Connecting...")
+        
         # Start client thread
         try:
+            # Process events to update UI
+            QApplication.processEvents()
+            
             self.client_thread = ClientThread(host, port, name, color, use_ssl=use_ssl)
+            
+            # CRITICAL FIX: DIRECTLY set score and length before the thread starts running
+            if current_score > 0:
+                self.log_message(f"Setting score to preserve: {current_score}, length: {current_length}")
+                self.client_thread.previous_score = current_score
+                self.client_thread.previous_length = current_length
+                self.client_thread.force_reconnect = True
+            
             self.client_thread.log_signal.connect(self.log_message)
             self.client_thread.connection_status_signal.connect(self.update_connection_status)
             self.client_thread.game_state_signal.connect(self.game_view.update_game_state)
-            self.client_thread.chat_message_signal.connect(self.add_chat_message)  # Connect chat signal
+            self.client_thread.chat_message_signal.connect(self.add_chat_message)
             self.client_thread.start()
         except Exception as e:
             QMessageBox.critical(self, "Connection Error", f"Could not connect to {host}:{port}\n{str(e)}")
+            self.connection_status_label.setText("Status: Disconnected")
 
     def log_message(self, message):
         self.log_list.addItem(message)
@@ -739,17 +1011,29 @@ class SnakeGameClientApp(QMainWindow):
             self.setWindowTitle(f'FunSnakes - {player_name}')
         else:
             self.setWindowTitle('FunSnakes - Multiplayer Snake Game')
+        
+        # When disconnected, save the score for this player name
+        if not connected and self.game_view and hasattr(self.game_view, 'highest_score'):
+            player_name = self.name_input.text().strip()
+            self.saved_scores[player_name] = {
+                'score': self.game_view.highest_score,
+                'length': self.game_view.highest_length
+            }
+            # print(f"Saved score for {player_name}: {self.game_view.highest_score}")
 
     def closeEvent(self, event):
+        # Ensure proper cleanup when closing the application
         if self.client_thread:
             self.client_thread.stop()
+            # Give it a moment to clean up
+            self.client_thread.wait(500)
         event.accept()
     
     def send_direction(self, dx, dy):
         """Send direction from keyboard input"""
         if self.client_thread and self.client_thread.isRunning():
             self.client_thread.set_direction(dx, dy)
-            print(f"Sending key direction: {dx}, {dy}")
+            
 
     def send_chat_message(self):
         """Send a chat message to other players"""

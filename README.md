@@ -38,15 +38,15 @@ FunSnakes was developed as a Computer Networks mini-project to demonstrate clien
 
 FunSnakes leverages several technologies to create a seamless multiplayer gaming experience:
 
-| Component             | Technology Used                                                                                                     |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| Programming Language  | Python 3.6+                                                                                                         |
-| User Interface        | PyQt5 Framework |
-| Network Communication | Socket API, TCP/IP                                                                                                  |
-| Security              | SSL/TLS Encryption                                                                                                  |
-| Data Exchange Format  | JSON                                                                                                                |
-| Concurrency           | Multi-threading                                                                                                     |
-| Graphics Rendering    | PyQt5 Graphics Framework                                                                                            |
+| Component             | Technology Used          |
+| --------------------- | ------------------------ |
+| Programming Language  | Python 3.6+              |
+| User Interface        | PyQt5 Framework          |
+| Network Communication | Socket API, TCP/IP       |
+| Security              | SSL/TLS Encryption       |
+| Data Exchange Format  | JSON                     |
+| Concurrency           | Multi-threading          |
+| Graphics Rendering    | PyQt5 Graphics Framework |
 
 ### 2.2 Networking Concepts Explained
 

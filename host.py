@@ -21,7 +21,7 @@ except ImportError as e:
 
 # Game constants - tune these for better performance
 WORLD_SIZE = 3000  # Increased map size
-FOOD_COUNT = 1050   # Reduced from 1200 to 300 for better performance
+FOOD_COUNT = 850   # Reduced from 1200 to 300 for better performance
 TICK_RATE = 15     # Higher tick rate for smoother experience
 SNAKE_RADIUS = 10  # Radius of the snake for collision detection
 
@@ -32,15 +32,16 @@ class Snake:
         self.color = color
         self.segments = []
         self.direction = [1, 0]  # Initial direction: right
-        self.speed = 7  # Increase this from 3 to 10 for more noticeable movement
+        self.speed = 4  # Keep the speed the same
         self.score = 0
         self.alive = True
         self.creation_time = time.time()  # Track when snake was created
-        # Initialize snake with 5 segments at random position
+        # Initialize snake with 5 segments at random position, with REDUCED spacing
         x = random.randint(100, WORLD_SIZE - 100)
         y = random.randint(100, WORLD_SIZE - 100)
         for i in range(5):
-            self.segments.append([x - i * 10, y])
+            # Reduce spacing from 5 to 3 units between initial segments for better turning
+            self.segments.append([x - i * 3, y])
 
     def update(self):
         if not self.alive:
@@ -93,30 +94,24 @@ class Snake:
         # Check if this snake's head collides with any segment of the other snake
         head = self.segments[0]
         
-        # Don't check collision with own head
-        start_index = 1 if other_snake.id == self.id else 0
-        
-        # Add a small grace period for new snakes
-        if time.time() - self.creation_time < 5:
-            return False
+        # If checking against self, skip collision detection completely
+        if other_snake.id == self.id:
+            return False  # Never collide with own body
         
         # Quick check to see if other snake is nearby before detailed collision check
-        if other_snake.id != self.id and other_snake.segments:
+        if other_snake.segments:
             other_head = other_snake.segments[0]
             approx_dist = abs(head[0] - other_head[0]) + abs(head[1] - other_head[1])
             # If snake heads are very far apart, skip detailed collision check
             if approx_dist > 500:  # Far enough that collision is impossible
                 return False
         
-        # Only check every other segment for performance (except head)
+        # Only check every other segment for performance (starting with the head)
         check_step = 2
-        for i in range(start_index, len(other_snake.segments), check_step):
+        for i in range(0, len(other_snake.segments), check_step):
             segment = other_snake.segments[i]
             distance = ((head[0] - segment[0])**2 + (head[1] - segment[1])**2)**0.5
             if distance < SNAKE_RADIUS * 1.2:
-                # Don't report collisions with your own first few segments
-                if other_snake.id == self.id and i < 3:
-                    continue
                 return True
             
         return False
@@ -149,6 +144,8 @@ class GameState:
         self.next_player_id = 1
         self.dead_players = {}  # Store dead players with death time: {player_id: death_time}
         self.respawn_delay = 5  # Respawn delay in seconds
+        self.log_message_callback = lambda msg: None  # Default empty callback for logging
+        self.player_name_to_id = {}  # Map player names to IDs for reconnection
         self.initialize_food()
     
     def initialize_food(self):
@@ -159,8 +156,25 @@ class GameState:
             self.foods.append([x, y])
     
     def add_snake(self, name, color):
-        player_id = self.next_player_id
-        self.next_player_id += 1
+        # Check if this player name has connected before
+        if name in self.player_name_to_id:
+            old_id = self.player_name_to_id[name]
+            # Use the old ID if it's not currently active
+            if old_id not in self.snakes:
+                player_id = old_id
+                # print(f"Reusing previous ID {player_id} for player {name}")
+            else:
+
+                player_id = self.next_player_id
+                self.next_player_id += 1
+                print(f"Player {name} already connected with ID {old_id}, assigning new ID {player_id}")
+        else:
+            # New player, assign a new ID
+            player_id = self.next_player_id
+            self.next_player_id += 1
+            
+        # Store this name-to-id mapping for future reconnections
+        self.player_name_to_id[name] = player_id
         
         # Create snake in a VERY safe location, far from other snakes
         is_safe = False
@@ -177,7 +191,8 @@ class GameState:
             new_snake = Snake(player_id, name, color)
             new_snake.segments = []
             for i in range(5):
-                new_snake.segments.append([x - i * 15, y])  # More spacing between segments
+                # Reduce spacing from 8 to 3 units for better turning
+                new_snake.segments.append([x - i * 3, y])
             
             # Assume safe until proven otherwise
             is_safe = True
@@ -210,12 +225,68 @@ class GameState:
             y = random.randint(WORLD_SIZE - 500, WORLD_SIZE - 200)
             new_snake.segments = []
             for i in range(5):
-                new_snake.segments.append([x - i * 15, y])
+                # Reduce spacing from 8 to 3 units here as well
+                new_snake.segments.append([x - i * 3, y])
         
         self.snakes[player_id] = new_snake
         print(f"Created snake: ID={player_id}, Name={name}, Alive={self.snakes[player_id].alive}")
         return player_id
     
+    def add_snake_with_score(self, name, color, score, length=5):
+        """Add a snake with an existing score and length (for reconnections)"""
+        # Check if this player name has connected before
+        if name in self.player_name_to_id:
+            player_id = self.player_name_to_id[name]
+            # print(f"Reusing previous ID {player_id} for reconnecting player {name}")
+        else:
+            # New player who somehow has a score (strange case)
+            player_id = self.next_player_id
+            self.next_player_id += 1
+            
+        # Update the name-to-id mapping
+        self.player_name_to_id[name] = player_id
+        
+        # Create a new snake at a random position
+        new_snake = Snake(player_id, name, color)
+        
+        # Set the previous score
+        if score > 0:
+            new_snake.score = score
+            # print(f"Restored score {score} for player {name} with ID {player_id}")
+            self.log_message_callback(f"Restored score {score} for reconnecting player {name}")
+        
+        # Adjust the snake length if needed (only if larger than default)
+        if length > 5:
+            # Get the head position and direction
+            head = new_snake.segments[0].copy()
+            direction = new_snake.direction
+            
+            # Clear existing segments
+            new_snake.segments = []
+            
+            # Recreate segments with the specified length
+            max_length = min(length, 100)  # Cap at 100 segments for performance
+            for i in range(max_length):
+                # Calculate position for this segment
+                # Reduce spacing from 5 to 3 units for better turning
+                segment_x = head[0] - direction[0] * i * 3
+                segment_y = head[1] - direction[1] * i * 3
+                
+                # Apply world wrap if needed
+                if segment_x < 0: segment_x += WORLD_SIZE
+                elif segment_x >= WORLD_SIZE: segment_x -= WORLD_SIZE
+                if segment_y < 0: segment_y += WORLD_SIZE
+                elif segment_y >= WORLD_SIZE: segment_y -= WORLD_SIZE
+                
+                new_snake.segments.append([segment_x, segment_y])
+                
+            # print(f"Restored length {max_length} for player {name}")
+            self.log_message_callback(f"Restored length {max_length} for reconnecting player {name}")
+        
+        # Add to snakes dictionary
+        self.snakes[player_id] = new_snake
+        return player_id
+
     def remove_snake(self, player_id):
         if player_id in self.snakes:
             del self.snakes[player_id]
@@ -262,8 +333,16 @@ class GameState:
             # Check for food collisions
             food_index = snake.check_food_collision(self.foods)
             if food_index is not None:
-                # Snake ate food
+                # Snake ate food - score increases by 1 point (unchanged)
                 snake.score += 1
+                
+                # Add a second segment to make growth rate 2x
+                # The snake already keeps its tail when food is eaten (growth of 1)
+                # Adding one more segment here makes the total growth rate 2 segments
+                if len(snake.segments) > 0:
+                    last_segment = snake.segments[-1].copy()
+                    snake.segments.append(last_segment)
+                
                 # Replace the eaten food with a new one
                 x = random.randint(0, WORLD_SIZE)
                 y = random.randint(0, WORLD_SIZE)
@@ -355,6 +434,9 @@ class ServerThread(QThread):
             self.log_signal.emit(f"Game server started on {local_ip}:{self.port} using {protocol}")
             self.running = True
 
+            # Set up the game state's logging callback
+            self.game_state.log_message_callback = lambda msg: self.log_signal.emit(msg)
+            
             # Start the game loop thread
             game_thread = threading.Thread(target=self.game_loop)
             game_thread.daemon = True
@@ -554,9 +636,23 @@ class ServerThread(QThread):
                 if message["type"] == "join":
                     player_name = message.get("name", f"Player{len(self.clients)+1}")
                     player_color = message.get("color", "#ff0000")
+                    is_reconnect = message.get("reconnect", False)
+                    last_score = int(message.get("last_score", 0))
+                    last_length = int(message.get("last_length", 5))  # Default to 5 segments
+                    
+                    # Add more detailed logging
+                    self.log_signal.emit(f"Player joining: {player_name}, reconnect={is_reconnect}, score={last_score}, length={last_length}")
                     
                     # Create a new snake for this player
-                    player_id = self.game_state.add_snake(player_name, player_color)
+                    if is_reconnect and last_score > 0:
+                        # Use the new method for reconnecting players with a score
+                        player_id = self.game_state.add_snake_with_score(
+                            player_name, player_color, last_score, last_length)
+                        self.log_signal.emit(f"Player {player_name} reconnected with score {last_score} and length {last_length}")
+                    else:
+                        # Normal new player
+                        player_id = self.game_state.add_snake(player_name, player_color)
+                        self.log_signal.emit(f"New player {player_name} joined from {address}")
                     
                     # Add client to our records
                     self.clients[client_socket] = player_id
@@ -569,7 +665,6 @@ class ServerThread(QThread):
                     }
                     client_socket.send(json.dumps(response).encode())
                     
-                    self.log_signal.emit(f"New player {player_name} (ID: {player_id}) joined from {address}")
                     self.clients_updated.emit(len(self.clients))
                     
                     # Enter message loop for this client
